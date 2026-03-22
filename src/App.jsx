@@ -26,7 +26,42 @@ const uid = () => Math.random().toString(36).slice(2, 9);
 const crFmt = v => (v != null && v !== "") ? `₹${Number(v).toFixed(2)} Cr` : "—";
 
 /* ── Role derived from set-name prefix ── */
+function roleFromSetName(setName) {
+  const s = (setName||"").toUpperCase();
+  if(s.startsWith("WK"))   return "WK";
+  if(s.startsWith("AR"))   return "AR";
+  if(s.startsWith("BAT"))  return "BAT";
+  if(s.startsWith("PACE")) return "BOWL";
+  if(s.startsWith("SPIN")) return "BOWL";
+  if(s.startsWith("BOWL")) return "BOWL";
+  return "BAT";
+}
 
+/* ── Parse IPL-style PLAYER LIST sheet with section headers ─────────────────
+   Handles: col1=set-header OR player-number, col2=player name, col3=base price
+   Section headers like "MARQUEE 1", "AR 2", "ACCELERATED SET" split into sets ── */
+function parseIPLPlayerList(sheet) {
+  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  const SET_PREFIXES = ["MARQUEE","AR","BAT","WK","PACE","SPIN","BOWL","ACCELERATED","FAST"];
+  const isSetHeader = (val) => {
+    const s = String(val||"").trim().toUpperCase();
+    return s.length>0 && isNaN(Number(s)) && s!=="PLAYER NO." && s!=="PLAYER NAME"
+      && SET_PREFIXES.some(p=>s.startsWith(p));
+  };
+  const sets=[]; let curName=null, curRole="BAT", curPlayers=[];
+  const push=()=>{ if(curName&&curPlayers.length>0) sets.push({ name:curName, players:curPlayers, increments:[...DEFAULT_INCS], isAccelerated:curName.toUpperCase().includes("ACCELERATED"), timerSecs:null }); };
+  for(const row of raw){
+    const col1=String(row[1]||"").trim(), col2=String(row[2]||"").trim(), col3=row[3];
+    if(isSetHeader(col1)){ push(); curName=col1; curRole=roleFromSetName(col1); curPlayers=[]; continue; }
+    if(!col2||col2==="PLAYER NAME"||col2==="") continue;
+    if(isNaN(Number(col1))&&col1!=="") continue;
+    const bp=parseFloat(col3); if(!col2||isNaN(bp)) continue;
+    const overseas=col2.includes("✈");
+    curPlayers.push({ id:uid(), name:col2.replace(/✈️?/g,"").trim(), role:curRole, basePrice:bp, overseas, set:curName||"Players" });
+  }
+  push();
+  return sets;
+}
 
 function parseSheet(sheet, sheetName) {
   const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
@@ -222,8 +257,8 @@ function TopBar({ screen, setScreen, hasAuction, role, roleLabel, syncStatus }) 
         </div>
       )}
       <button className="help-btn" onClick={()=>setShowHelp(true)} title="Help">?</button>
-      {showHelp && <HelpModal role={role} onClose={()=>setShowHelp(false)} />}
     </div>
+    {showHelp && <HelpModal role={role} onClose={()=>setShowHelp(false)} />}
   );
 }
 
@@ -573,7 +608,7 @@ function SetupScreen({ teams, setTeams, sets, setSets, onStart, syncStatus }) {
             <span key={s.name} className="info-pill accel-pill">⚡ {s.name}</span>
           ))}
         </div>
-        <button className="btn-start" disabled={sets.filter(s=>!s.isAccelerated).length===0||teams.length<2} onClick={()=>onStart(hostPin||"1234", parseInt(timerSecs)||0, fbCfg, roomCode)}>
+        <button className="btn-start" disabled={sets.filter(s=>!s.isAccelerated&&s.players.length>0).length===0||teams.length<2} onClick={()=>onStart(hostPin||"1234", parseInt(timerSecs)||0, fbCfg, roomCode)}>
           <span>Begin Auction</span>
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
         </button>
@@ -652,34 +687,105 @@ function TeamsPanel({ teams, setTeams }) {
 }
 
 function PlayersPanel({ sets, setSets }) {
+  const [newSetName, setNewSetName] = useState("");
+  const [activeSet, setActiveSet] = useState(null);
+  const [pForm, setPForm] = useState({ name:"", role:"BAT", basePrice:"0.20", overseas:false });
+  const [showUpload, setShowUpload] = useState(false);
+  const [bulkSetName, setBulkSetName] = useState(null); // which set is in bulk-paste mode
+  const [bulkText, setBulkText] = useState("");
+  const [bulkRole, setBulkRole] = useState("BAT");
+  const [bulkBp, setBulkBp] = useState("0.20");
   const fileRef = useRef();
+
+  // ── Bulk paste: one name per line, ✈️ suffix = overseas ──────────────────
+  const applyBulk = (sn) => {
+    const lines = bulkText.split("\n").map(l=>l.trim()).filter(Boolean);
+    const players = lines.map(line => {
+      const overseas = line.includes("✈") || line.toLowerCase().endsWith("(ovs)") || line.toLowerCase().endsWith(" ovs");
+      const name = line.replace(/✈️?/g,"").replace(/\(ovs\)/gi,"").replace(/ ovs$/gi,"").trim();
+      return { id:uid(), name, role:bulkRole, basePrice:parseFloat(bulkBp)||0.20, overseas, set:sn };
+    });
+    setSets(ss=>ss.map(s=>s.name===sn?{...s,players:[...s.players,...players]}:s));
+    setBulkText(""); setBulkSetName(null);
+  };
+
   const handleFile = e => {
     const file = e.target.files[0]; if(!file) return;
     const reader = new FileReader();
     reader.onload = ev => {
-      const wb = XLSX.read(ev.target.result,{type:"array"});
-      setSets(wb.SheetNames.map(name=>({ name, players:parseSheet(wb.Sheets[name],name), increments:[...DEFAULT_INCS], isAccelerated:false, timerSecs:null })).filter(s=>s.players.length>0));
+      try {
+        const wb = XLSX.read(ev.target.result,{type:"array"});
+        const SKIP = ["CURRENT SQUADS","DASHBOARD","SQUADS","SUMMARY","SETTINGS","INSTRUCTIONS"];
+        const sheetNames = wb.SheetNames.filter(n=>!SKIP.includes(n.toUpperCase().trim()));
+        const PLAYER_LIST = ["PLAYER LIST","PLAYERS","PLAYER LIST 2026","PLAYERS LIST"];
+        const plSheet = sheetNames.find(n=>PLAYER_LIST.includes(n.toUpperCase().trim()));
+        if(plSheet){
+          setSets(parseIPLPlayerList(wb.Sheets[plSheet]).filter(s=>s.players.length>0));
+        } else {
+          setSets(sheetNames.map(name=>({ name, players:parseSheet(wb.Sheets[name],name), increments:[...DEFAULT_INCS], isAccelerated:false, timerSecs:null })).filter(s=>s.players.length>0));
+        }
+        setShowUpload(false);
+      } catch(err){ console.error("Upload error:",err); }
     };
     reader.readAsArrayBuffer(file); e.target.value="";
   };
-  const removeSet = name => setSets(ss=>ss.filter(s=>s.name!==name));
-  const removePlayer = (sn,pid) => setSets(ss=>ss.map(s=>s.name===sn?{...s,players:s.players.filter(p=>p.id!==pid)}:s));
+
+  const addSet = () => {
+    const name = newSetName.trim(); if(!name) return;
+    if(sets.find(s=>s.name===name)) return;
+    setSets(ss=>[...ss, { name, players:[], increments:[...DEFAULT_INCS], isAccelerated:false, timerSecs:null }]);
+    setNewSetName(""); setActiveSet(name);
+  };
+
+  const removeSet = name => { setSets(ss=>ss.filter(s=>s.name!==name)); if(activeSet===name) setActiveSet(null); };
   const toggleAccel = name => setSets(ss=>ss.map(s=>s.name===name?{...s,isAccelerated:!s.isAccelerated}:s));
   const updateInc = (sn,i,v) => { const n=parseFloat(v); if(!isNaN(n)&&n>0) setSets(ss=>ss.map(s=>s.name===sn?{...s,increments:s.increments.map((x,j)=>j===i?n:x)}:s)); };
   const updateTimer = (sn,v) => setSets(ss=>ss.map(s=>s.name===sn?{...s,timerSecs:v==="default"?null:parseInt(v)||0}:s));
+
+  const addPlayer = (sn) => {
+    const name = pForm.name.trim(); if(!name) return;
+    const bp = parseFloat(pForm.basePrice)||0.20;
+    const p = { id:uid(), name, role:pForm.role, basePrice:bp, overseas:pForm.overseas, set:sn };
+    setSets(ss=>ss.map(s=>s.name===sn?{...s,players:[...s.players,p]}:s));
+    setPForm(f=>({...f, name:"", overseas:false}));
+  };
+
+  const removePlayer = (sn,pid) => setSets(ss=>ss.map(s=>s.name===sn?{...s,players:s.players.filter(p=>p.id!==pid)}:s));
+
   return (
     <div className="panel">
       <div className="panel-head"><span className="step-chip">02</span>Player Sets</div>
-      <div className="upload-zone" onClick={()=>fileRef.current.click()}>
-        <div className="upload-icon">📂</div>
-        <div className="upload-main">Upload Spreadsheet</div>
-        <div className="upload-sub">Each sheet becomes a set · auctioned in tab order<br/><code>Name</code> · <code>Role</code> (BAT/BOWL/AR/WK) · <code>Base Price</code> · <code>Overseas</code></div>
-        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={handleFile}/>
+
+      {/* Upload or manual toggle */}
+      <div className="players-source-row">
+        <button className={`source-tab ${!showUpload?"source-tab-on":""}`} onClick={()=>setShowUpload(false)}>✏️ Manual</button>
+        <button className={`source-tab ${showUpload?"source-tab-on":""}`} onClick={()=>setShowUpload(true)}>📂 Upload Spreadsheet</button>
       </div>
+
+      {showUpload && (
+        <div className="upload-zone" onClick={()=>fileRef.current.click()}>
+          <div className="upload-icon">📂</div>
+          <div className="upload-main">Click to upload</div>
+          <div className="upload-sub">Supports IPL-style PLAYER LIST (MARQUEE/AR/BAT/WK/PACE/SPIN auto-detected)<br/>or standard format: <code>Name</code> · <code>Role</code> · <code>Base Price</code> · <code>Overseas</code></div>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={handleFile}/>
+        </div>
+      )}
+
+      {/* Add new set */}
+      {!showUpload && <div className="add-set-row">
+        <input className="inp" value={newSetName} onChange={e=>setNewSetName(e.target.value)}
+          onKeyDown={e=>e.key==="Enter"&&addSet()}
+          placeholder="Set name e.g. Marquee, Bowlers, All-Rounders…" />
+        <button className="btn-add" onClick={addSet}>+ Add Set</button>
+      </div>}
+
+      {sets.length===0 && !showUpload && <div className="empty-hint">Add a set above or upload a spreadsheet to get started</div>}
+
       {sets.length>0&&(
         <div className="sets-list">
           {sets.map((s,si)=>(
-            <details key={s.name} className={`set-block ${s.isAccelerated?"set-block-accel":""}`} open={si===0}>
+            <details key={s.name} className={`set-block ${s.isAccelerated?"set-block-accel":""}`}
+              open={activeSet===s.name} onToggle={e=>setActiveSet(e.target.open?s.name:null)}>
               <summary className="set-summary">
                 <span className="set-order">#{si+1}</span>
                 <span className="set-name">{s.name}</span>
@@ -688,6 +794,8 @@ function PlayersPanel({ sets, setSets }) {
                 <button className={`toggle-accel-btn ${s.isAccelerated?"toggle-accel-on":""}`} onClick={e=>{e.preventDefault();toggleAccel(s.name);}}>⚡</button>
                 <button className="icon-btn danger" onClick={e=>{e.preventDefault();removeSet(s.name);}}>✕</button>
               </summary>
+
+              {/* Bid increments */}
               <div className="inc-editor">
                 <div className="inc-label">Bid Increments (Cr)</div>
                 <div className="inc-row">
@@ -699,6 +807,8 @@ function PlayersPanel({ sets, setSets }) {
                   ))}
                 </div>
               </div>
+
+              {/* Timer */}
               <div className="inc-row" style={{marginTop:".4rem",alignItems:"center"}}>
                 <span className="inc-tag" style={{whiteSpace:"nowrap"}}>⏱ Timer</span>
                 <select className="inp inc-timer-sel" value={s.timerSecs===null?"default":String(s.timerSecs)} onChange={e=>updateTimer(s.name,e.target.value)}>
@@ -712,13 +822,68 @@ function PlayersPanel({ sets, setSets }) {
                   <option value="120">2 min</option>
                 </select>
               </div>
+
+              {/* Add player — form or bulk paste tabs */}
+              <div className="add-player-form">
+                <div className="ap-mode-tabs">
+                  <button className={`ap-mode-tab ${bulkSetName!==s.name?"ap-mode-on":""}`}
+                    onClick={()=>setBulkSetName(null)}>+ One by one</button>
+                  <button className={`ap-mode-tab ${bulkSetName===s.name?"ap-mode-on":""}`}
+                    onClick={()=>setBulkSetName(s.name)}>📋 Bulk paste</button>
+                </div>
+
+                {bulkSetName!==s.name ? (
+                  <div className="add-player-row">
+                    <input className="inp ap-name-inp" value={pForm.name}
+                      onChange={e=>setPForm(f=>({...f,name:e.target.value}))}
+                      onKeyDown={e=>e.key==="Enter"&&addPlayer(s.name)}
+                      placeholder="Player name…" />
+                    <select className="inp ap-role-sel" value={pForm.role} onChange={e=>setPForm(f=>({...f,role:e.target.value}))}>
+                      <option value="BAT">BAT</option>
+                      <option value="BOWL">BOWL</option>
+                      <option value="AR">AR</option>
+                      <option value="WK">WK</option>
+                    </select>
+                    <input className="inp ap-bp-inp" type="number" step="0.05" min="0.05" value={pForm.basePrice}
+                      onChange={e=>setPForm(f=>({...f,basePrice:e.target.value}))} placeholder="Base Cr" />
+                    <button className={`ovs-toggle ${pForm.overseas?"ovs-on":""}`}
+                      onClick={()=>setPForm(f=>({...f,overseas:!f.overseas}))} title="Overseas">✈️</button>
+                    <button className="btn-add ap-add-btn" onClick={()=>addPlayer(s.name)}>+</button>
+                  </div>
+                ) : (
+                  <div className="bulk-wrap">
+                    <div className="bulk-hint">One player per line. Add ✈️ after a name to mark overseas.<br/>e.g. <em>Rohit Sharma</em> or <em>Travis Head ✈️</em></div>
+                    <textarea className="inp bulk-textarea" value={bulkText}
+                      onChange={e=>setBulkText(e.target.value)}
+                      placeholder={"Rohit Sharma\nVirat Kohli\nTravis Head ✈️\nJasprit Bumrah"}
+                      rows={6} />
+                    <div className="bulk-controls">
+                      <select className="inp ap-role-sel" value={bulkRole} onChange={e=>setBulkRole(e.target.value)}>
+                        <option value="BAT">BAT</option>
+                        <option value="BOWL">BOWL</option>
+                        <option value="AR">AR</option>
+                        <option value="WK">WK</option>
+                      </select>
+                      <input className="inp ap-bp-inp" type="number" step="0.05" min="0.05" value={bulkBp}
+                        onChange={e=>setBulkBp(e.target.value)} placeholder="Base Cr" />
+                      <button className="btn-add" onClick={()=>applyBulk(s.name)}
+                        disabled={!bulkText.trim()}>
+                        Add {bulkText.split("\n").filter(l=>l.trim()).length||0} players
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Player list */}
               <div className="set-players">
+                {s.players.length===0&&<div className="empty-hint">No players yet — add one above</div>}
                 {s.players.map(p=>(
                   <div key={p.id} className="set-player-row">
                     <span className="role-pip" style={{background:ROLE_COLOR[p.role]}}/>
                     <span className="sp-name">{p.name}</span>
                     <span className="sp-role" style={{color:ROLE_COLOR[p.role]}}>{p.role}</span>
-                    {p.overseas&&<span className="ovs-pip">OVS</span>}
+                    {p.overseas&&<span className="ovs-pip">✈️</span>}
                     <span className="sp-price">{crFmt(p.basePrice)}</span>
                     <button className="icon-btn danger small" onClick={()=>removePlayer(s.name,p.id)}>✕</button>
                   </div>
@@ -728,7 +893,6 @@ function PlayersPanel({ sets, setSets }) {
           ))}
         </div>
       )}
-      {sets.length===0&&<div className="empty-hint">Upload a spreadsheet to populate sets</div>}
     </div>
   );
 }
@@ -2204,9 +2368,9 @@ const CSS = `
 
   /* ── help modal overlay ── */
   .help-overlay{
-    position:fixed;inset:0;background:rgba(0,0,0,.8);
+    position:fixed;inset:0;background:rgba(0,0,0,.85);
     display:flex;align-items:center;justify-content:center;
-    z-index:200;backdrop-filter:blur(8px);padding:1rem;
+    z-index:9999;backdrop-filter:blur(10px);padding:1rem;
   }
   .help-modal{
     background:var(--surface);border:1px solid var(--border-glow);border-radius:20px;
@@ -2480,5 +2644,40 @@ const CSS = `
 
   /* ── fcard colour bar ── */
   .fcard-color-bar{height:3px;border-radius:0 0 0 0;margin:-0px -0px 6px;border-radius:4px 4px 0 0;opacity:.9}
+
+  /* ── add set row ── */
+  .add-set-row{display:flex;gap:.5rem;align-items:center}
+  .add-set-row .inp{flex:1}
+
+  /* ── add player form ── */
+  .add-player-form{padding:.6rem 0 .4rem;border-top:1px solid var(--border);margin-top:.5rem}
+  .add-player-row{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+  .ap-name-inp{flex:1;min-width:120px}
+  .ap-role-sel{width:80px!important;flex-shrink:0}
+  .ap-bp-inp{width:80px!important;flex-shrink:0}
+  .ap-add-btn{flex-shrink:0;padding:.4rem .75rem!important}
+  .ovs-toggle{background:var(--surface2);border:1px solid var(--border);padding:.3rem .45rem;border-radius:8px;cursor:pointer;font-size:1rem;line-height:1;transition:all .15s;flex-shrink:0}
+  .ovs-on{background:#0a1a2e;border-color:#00f0ff;box-shadow:0 0 8px #00f0ff33}
+
+  /* ── players source toggle ── */
+  .players-source-row{display:flex;gap:.4rem;margin-bottom:.5rem}
+  .source-tab{flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--muted);padding:.4rem .6rem;border-radius:8px;cursor:pointer;font-size:.78rem;font-weight:600;font-family:'Inter',sans-serif;transition:all .15s;text-align:center}
+  .source-tab:hover{border-color:var(--iris);color:var(--text)}
+  .source-tab-on{background:linear-gradient(135deg,#7c5bff,#c040ff);border-color:transparent!important;color:#fff!important;box-shadow:0 0 10px #a040ff33}
+
+  /* ── player entry mode tabs ── */
+  .ap-mode-tabs{display:flex;gap:.3rem;margin-bottom:.5rem}
+  .ap-mode-tab{flex:1;background:transparent;border:1px solid var(--border);color:var(--muted);padding:.28rem .5rem;border-radius:7px;cursor:pointer;font-size:.72rem;font-weight:600;font-family:'Inter',sans-serif;transition:all .15s;text-align:center}
+  .ap-mode-tab:hover{border-color:var(--border-glow);color:var(--text)}
+  .ap-mode-on{background:var(--surface2);border-color:var(--iris)!important;color:var(--iris)!important}
+
+  /* ── bulk paste ── */
+  .bulk-wrap{display:flex;flex-direction:column;gap:.5rem}
+  .bulk-hint{font-size:.72rem;color:var(--muted);line-height:1.5}
+  .bulk-hint em{color:var(--text);font-style:normal;font-weight:500}
+  .bulk-textarea{resize:vertical;min-height:100px;font-size:.82rem!important;line-height:1.6!important;font-family:'Inter',sans-serif!important}
+  .bulk-controls{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+  .bulk-controls .btn-add{flex:1;min-width:120px}
   ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border-glow);border-radius:2px}
 `;
+
