@@ -117,9 +117,9 @@ export default function App() {
   };
 
 
-  const startAuction = async (hostPin, timerSecs, cfg, code) => {
+  const startAuction = async (hostPin, timerSecs, cfg, code, auctionMode="standard") => {
     const queue = sets.filter(s=>!s.isAccelerated).flatMap(s=>s.players.map(p=>({...p,set:s.name,increments:s.increments,setTimer:s.timerSecs})));
-    const initialState = { queue, sets, current:null, currentBid:0, currentBidder:null, bidHistory:[], sold:[], unsold:[], accelPool:[], status:"idle", teams:teams.map(t=>({...t,players:[]})), currentIncrements:DEFAULT_INCS, hostPin, defaultTimer:timerSecs, timerLeft:timerSecs, timerRunning:false };
+    const initialState = { queue, sets, current:null, currentBid:0, currentBidder:null, bidHistory:[], sold:[], unsold:[], accelPool:[], status:"idle", teams:teams.map(t=>({...t,players:[]})), currentIncrements:DEFAULT_INCS, hostPin, defaultTimer:timerSecs, timerLeft:timerSecs, timerRunning:false, auctionMode, silentBids:{}, silentTimer:30, silentRunning:false };
     if(cfg && code) {
       try {
         setSyncStatus("connecting");
@@ -189,7 +189,7 @@ export default function App() {
       <TopBar screen={screen} setScreen={setScreen} hasAuction={!!auction} role={role} roleLabel={roleLabel} syncStatus={syncStatus} onHome={()=>{ setRole(null); setRoleLabel(""); setScreen("login"); }} />
       {screen==="login"   && <LoginScreen teams={teams} auction={auction} syncStatus={syncStatus} saves={saves} onDeleteSave={deleteSave} onResumeSave={resumeSave} onLogin={(r,lbl,cfg,code)=>{setRole(r);setRoleLabel(lbl);if(cfg&&code&&r!=="host"){joinRoom(cfg,code);}setScreen(r==="host"?"setup":"auction");}} />}
       {screen==="setup"   && role==="host" && <SetupScreen teams={teams} setTeams={setTeams} sets={sets} setSets={setSets} onStart={startAuction} syncStatus={syncStatus} />}
-      {screen==="auction" && auction && <AuctionScreen auction={auction} setAuction={setAuctionSync} setScreen={setScreen} role={role} syncStatus={syncStatus} onSave={saveAuction} />}
+      {screen==="auction" && auction && (auction.auctionMode==="silent" ? <SilentAuctionScreen auction={auction} setAuction={setAuctionSync} setScreen={setScreen} role={role} syncStatus={syncStatus} onSave={saveAuction} /> : <AuctionScreen auction={auction} setAuction={setAuctionSync} setScreen={setScreen} role={role} syncStatus={syncStatus} onSave={saveAuction} />)}
       {screen==="results" && auction && <ResultsScreen auction={auction} onSave={saveAuction} />}
     </div>
   );
@@ -611,10 +611,14 @@ function SetupScreen({ teams, setTeams, sets, setSets, onStart, syncStatus }) {
             <span key={s.name} className="info-pill accel-pill">⚡ {s.name}</span>
           ))}
         </div>
-        <button className="btn-start" disabled={sets.filter(s=>!s.isAccelerated&&s.players.length>0).length===0||teams.length<2} onClick={()=>onStart(hostPin||"1234", parseInt(timerSecs)||0, fbCfg, roomCode)}>
-          <span>Begin Auction</span>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-        </button>
+        <div className="start-mode-btns">
+          <button className="btn-start" disabled={sets.filter(s=>!s.isAccelerated&&s.players.length>0).length===0||teams.length<2} onClick={()=>onStart(hostPin||"1234", parseInt(timerSecs)||0, fbCfg, roomCode, "standard")}>
+            <span>🎙 Standard Auction</span>
+          </button>
+          <button className="btn-start btn-silent-start" disabled={sets.filter(s=>!s.isAccelerated&&s.players.length>0).length===0||teams.length<2} onClick={()=>onStart(hostPin||"1234", parseInt(timerSecs)||0, fbCfg, roomCode, "silent")}>
+            <span>🤫 Silent Bid Mode</span>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1746,6 +1750,306 @@ function Field({ label, children }) {
   return <div className="field"><label className="field-label">{label}</label>{children}</div>;
 }
 
+
+/* ── SILENT BID AUCTION SCREEN ────────────────────────────────────────────── */
+function SilentAuctionScreen({ auction:a, setAuction, setScreen, role, syncStatus, onSave }) {
+  const isHost = role==="host";
+  const myTeam = role!=="host" ? a.teams.find(t=>t.id===role) : null;
+  const upd = fn => setAuction(prev=>fn(prev));
+
+  // Silent bid timer
+  useEffect(()=>{
+    if(!a.silentRunning || a.silentTimer<=0) return;
+    const id = setInterval(()=>{
+      setAuction(prev=>{
+        if(!prev.silentRunning) return prev;
+        if(prev.silentTimer<=1) return {...prev, silentRunning:false, silentTimer:0, status:"silent_reveal"};
+        return {...prev, silentTimer:prev.silentTimer-1};
+      });
+    },1000);
+    return ()=>clearInterval(id);
+  },[a.silentRunning, a.silentTimer]);
+
+  const pickNext = () => upd(prev=>{
+    if(prev.queue.length===0) return {...prev, status:"done"};
+    const [next,...rest] = prev.queue;
+    return {...prev, current:next, queue:rest, currentBid:next.basePrice, currentBidder:null,
+      bidHistory:[], silentBids:{}, silentTimer:30, silentRunning:false,
+      status:"silent_idle", currentIncrements:next.increments||DEFAULT_INCS};
+  });
+
+  const startSilent = () => upd(prev=>({...prev, status:"silent_bidding", silentRunning:true, silentTimer:30, silentBids:{}}));
+
+  const submitSilentBid = (teamId, amount) => {
+    const val = parseFloat(amount);
+    if(isNaN(val) || val < (a.current?.basePrice||0)) return;
+    upd(prev=>({...prev, silentBids:{...prev.silentBids, [teamId]:val}}));
+  };
+
+  const revealBids = () => upd(prev=>({...prev, status:"silent_reveal", silentRunning:false}));
+
+  const resolveSilent = () => {
+    const bids = a.silentBids||{};
+    const entries = Object.entries(bids).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
+    if(entries.length===0){
+      upd(prev=>({...prev, status:"idle", current:null, unsold:[...prev.unsold, prev.current]}));
+      return;
+    }
+    const maxBid = entries[0][1];
+    const tied = entries.filter(([,v])=>v===maxBid);
+    if(tied.length===1){
+      // One winner — sold
+      const [winnerId] = tied[0];
+      const winner = a.teams.find(t=>t.id===winnerId);
+      upd(prev=>({...prev, status:"idle", current:null,
+        sold:[...prev.sold,{...prev.current, soldTo:winnerId, soldFor:maxBid}],
+        teams:prev.teams.map(t=>t.id===winnerId?{...t,spent:t.spent+maxBid,players:[...t.players,{...prev.current,soldFor:maxBid}]}:t)
+      }));
+    } else {
+      // Tie — switch to live standard bidding with max bid as base
+      upd(prev=>({...prev, status:"bidding", currentBid:maxBid, currentBidder:null,
+        bidHistory:[{team:"SILENT TIE", amount:maxBid}],
+        timerLeft:prev.defaultTimer||0, timerRunning:(prev.defaultTimer||0)>0,
+        silentTiedTeams: tied.map(([id])=>id)
+      }));
+    }
+  };
+
+  const cur = a.current;
+  const bids = a.silentBids||{};
+  const submittedCount = Object.keys(bids).length;
+
+  // ── If in tie-breaker mode, render a mini standard auction ──
+  if(a.status==="bidding" && a.silentTiedTeams) {
+    return <AuctionScreenInner auction={a} setAuction={setAuction} setScreen={setScreen} role={role} syncStatus={syncStatus} onSave={onSave} silentMode />;
+  }
+
+  if(a.status==="done") return (
+    <div className="page center-page">
+      <div className="done-card">
+        <div className="done-glow"/>
+        <div style={{fontSize:"3rem",zIndex:1,position:"relative"}}>🤫</div>
+        <h2 className="done-title">Silent Auction Complete!</h2>
+        <p className="done-sub">{a.sold.length} sold · {a.unsold.length} unsold</p>
+        <button className="btn-start" onClick={()=>setScreen("results")} style={{position:"relative",zIndex:1}}>View Final Squads →</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="auction-root">
+      {/* LEFT — teams */}
+      <div className="side-panel">
+        <div className="side-title">FRANCHISES</div>
+        {a.teams.map(t=>{
+          const tc=t.color||TEAM_COLORS[a.teams.indexOf(t)%TEAM_COLORS.length];
+          const hasBid = bids[t.id]!==undefined;
+          return (
+            <div key={t.id} className="fcard" style={{borderColor:hasBid&&a.status==="silent_bidding"?tc:undefined}}>
+              <div className="fcard-color-bar" style={{background:tc}}/>
+              <div className="fcard-top">
+                <span className="fcard-name" style={{color:tc}}>{t.name}</span>
+                {a.status==="silent_bidding" && (
+                  <span className="silent-submitted-tag" style={{background:hasBid?"#00ff8822":"transparent", color:hasBid?"#00ff88":"var(--muted)", border:`1px solid ${hasBid?"#00ff8844":"var(--border)"}`}}>
+                    {hasBid?"✓ IN":"..."}
+                  </span>
+                )}
+                {a.status==="silent_reveal" && bids[t.id]!==undefined && (
+                  <span className="silent-reveal-bid" style={{color:tc}}>₹{bids[t.id].toFixed(2)} Cr</span>
+                )}
+              </div>
+              <div className="fcard-stats">
+                <span>{t.players.length}/{t.maxPlayers}</span>
+                <span className="budget-remain" style={{color:tc}}>{crFmt(t.budget-t.spent)}</span>
+              </div>
+              <div className="budget-track"><div className="budget-fill" style={{width:`${Math.min((t.spent/t.budget)*100,100)}%`,background:tc,boxShadow:`0 0 8px ${tc}88`}}/></div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* CENTRE — main stage */}
+      <div className="centre-panel">
+        {/* Mode badge */}
+        <div className="silent-mode-badge">🤫 SILENT BID MODE</div>
+
+        {/* Idle — waiting to draw */}
+        {(a.status==="idle"||a.status==="silent_idle"||!a.status.startsWith("silent")) && a.status!=="silent_bidding" && a.status!=="silent_reveal" && (
+          <div className="idle-wrap">
+            {a.queue.length>0&&<div className="idle-count">{a.queue.length} players remaining</div>}
+            {isHost && <button className="btn-draw" onClick={pickNext} disabled={a.queue.length===0}>🎲 Draw Next Player</button>}
+            {isHost && <button className="btn-end-subtle" onClick={()=>upd(p=>({...p,status:"done"}))}>End Auction</button>}
+            {!isHost && <div className="waiting-msg">⏳ Waiting for host to draw next player…</div>}
+          </div>
+        )}
+
+        {/* Player drawn — waiting to start silent phase */}
+        {a.status==="silent_idle" && cur && (
+          <div className="stage-wrap">
+            <div className="player-card player-card-enter">
+              <div className="player-card-glow" style={{background:`radial-gradient(circle at 50% 0%, ${ROLE_COLOR[cur.role]}18, transparent 70%)`}}/>
+              <div className="pc-set">{cur.set}</div>
+              <div className="pc-name">{cur.name}</div>
+              <div className="pc-tags">
+                <span className="role-tag" style={{background:ROLE_BG[cur.role],color:ROLE_COLOR[cur.role],border:`1px solid ${ROLE_COLOR[cur.role]}55`}}>{cur.role}</span>
+                {cur.overseas&&<span className="ovs-tag">✈️ Overseas</span>}
+              </div>
+              <div className="pc-base">Base: {crFmt(cur.basePrice)}</div>
+            </div>
+            {isHost && <button className="btn-draw silent-start-btn" onClick={startSilent}>🤫 Start Silent Bidding</button>}
+            {!isHost && <div className="waiting-msg">⏳ Host is about to open silent bidding…</div>}
+          </div>
+        )}
+
+        {/* Silent bidding in progress */}
+        {a.status==="silent_bidding" && cur && (
+          <div className="stage-wrap">
+            <div className="player-card player-card-enter">
+              <div className="pc-set">{cur.set}</div>
+              <div className="pc-name">{cur.name}</div>
+              <div className="pc-tags">
+                <span className="role-tag" style={{background:ROLE_BG[cur.role],color:ROLE_COLOR[cur.role],border:`1px solid ${ROLE_COLOR[cur.role]}55`}}>{cur.role}</span>
+                {cur.overseas&&<span className="ovs-tag">✈️ Overseas</span>}
+              </div>
+              <div className="pc-base">Base: {crFmt(cur.basePrice)}</div>
+            </div>
+
+            {/* Big countdown */}
+            <div className={`silent-countdown ${a.silentTimer<=10?"silent-crit":a.silentTimer<=20?"silent-warn":""}`}>
+              <div className="silent-timer-num">{a.silentTimer}</div>
+              <div className="silent-timer-lbl">seconds to bid</div>
+            </div>
+
+            <div className="silent-bid-status">{submittedCount} / {a.teams.length} bids submitted</div>
+
+            {/* My team bid input */}
+            {!isHost && myTeam && !bids[myTeam.id] && (
+              <SilentBidInput team={myTeam} basePrice={cur.basePrice} onSubmit={(amt)=>submitSilentBid(myTeam.id, amt)} />
+            )}
+            {!isHost && myTeam && bids[myTeam.id] && (
+              <div className="silent-bid-confirmed">✅ Bid submitted — sit tight!</div>
+            )}
+
+            {/* Host override — can enter bid for any team */}
+            {isHost && (
+              <div className="silent-host-override">
+                <div className="silent-override-title">Host Override — Enter bid for team</div>
+                {a.teams.map(t=>(
+                  <SilentBidInput key={t.id} team={t} basePrice={cur.basePrice}
+                    onSubmit={(amt)=>submitSilentBid(t.id,amt)}
+                    existing={bids[t.id]} compact />
+                ))}
+                <button className="btn-draw" style={{marginTop:".5rem"}} onClick={revealBids}>🔓 Reveal Bids Now</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Reveal phase */}
+        {a.status==="silent_reveal" && cur && (
+          <div className="stage-wrap">
+            <div className="silent-reveal-title">🔓 BIDS REVEALED</div>
+            <div className="player-card">
+              <div className="pc-name">{cur.name}</div>
+              <div className="pc-tags">
+                <span className="role-tag" style={{background:ROLE_BG[cur.role],color:ROLE_COLOR[cur.role],border:`1px solid ${ROLE_COLOR[cur.role]}55`}}>{cur.role}</span>
+              </div>
+            </div>
+            <div className="silent-bids-reveal">
+              {[...a.teams].sort((x,y)=>(bids[y.id]||0)-(bids[x.id]||0)).map((t,i)=>{
+                const bid = bids[t.id];
+                const tc = t.color||TEAM_COLORS[a.teams.indexOf(t)%TEAM_COLORS.length];
+                const maxBid = Math.max(...Object.values(bids).filter(v=>v>0), 0);
+                const isWinner = bid===maxBid && bid>0;
+                const entries = Object.entries(bids).filter(([,v])=>v===maxBid);
+                const isTie = isWinner && entries.length>1;
+                return (
+                  <div key={t.id} className={`silent-bid-row ${isWinner?"silent-bid-winner":""}`} style={{borderColor:isWinner?tc:"var(--border)"}}>
+                    <span className="silent-bid-rank" style={{color:tc}}>#{i+1}</span>
+                    <span className="silent-bid-team" style={{color:tc}}>{t.name}</span>
+                    <span className="silent-bid-amount">{bid!=null?crFmt(bid):"No bid"}</span>
+                    {isWinner && !isTie && <span className="silent-winner-tag">🏆 WINNER</span>}
+                    {isTie && <span className="silent-tie-tag">🤝 TIE</span>}
+                  </div>
+                );
+              })}
+            </div>
+            {isHost && (
+              <div className="verdict-row" style={{marginTop:"1rem"}}>
+                <button className="btn-sold" onClick={resolveSilent}>
+                  {(()=>{const maxBid=Math.max(...Object.values(bids).filter(v=>v>0),0); const tied=Object.entries(bids).filter(([,v])=>v===maxBid); return tied.length>1?"⚡ Start Tie-Breaker":"✅ Confirm Sale";})()}
+                </button>
+                <button className="btn-unsold" onClick={()=>upd(p=>({...p,status:"idle",current:null,unsold:[...p.unsold,p.current]}))}>✕ Unsold</button>
+              </div>
+            )}
+            {!isHost && <div className="waiting-msg">⏳ Waiting for host to confirm…</div>}
+          </div>
+        )}
+      </div>
+
+      {/* RIGHT — sold log */}
+      <div className="side-panel right-panel">
+        <div className="side-title">SOLD ({a.sold.length})</div>
+        <div className="sold-log">
+          {a.sold.slice().reverse().map(p=>{
+            const t=a.teams.find(x=>x.id===p.soldTo);
+            return (
+              <div key={p.id} className="sold-row">
+                <span className="role-pip" style={{background:ROLE_COLOR[p.role]}}/>
+                <span className="sold-name">{p.name}</span>
+                <span className="sold-price">{crFmt(p.soldFor)}</span>
+                <span className="sold-team">{t?.name}</span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="side-title" style={{marginTop:"1rem"}}>UNSOLD ({a.unsold.length})</div>
+        <div className="sold-log">
+          {a.unsold.slice().reverse().map(p=>(
+            <div key={p.id} className="sold-row">
+              <span className="role-pip" style={{background:ROLE_COLOR[p.role]}}/>
+              <span className="sold-name">{p.name}</span>
+              <span style={{color:"var(--muted)",fontSize:".7rem"}}>unsold</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Silent bid input widget ── */
+function SilentBidInput({ team, basePrice, onSubmit, existing, compact }) {
+  const [val, setVal] = useState(existing!=null?String(existing):"");
+  const submit = () => {
+    const n = parseFloat(val);
+    if(isNaN(n)||n<basePrice) return;
+    onSubmit(n);
+  };
+  const tc = team.color||TEAM_COLORS[0];
+  return (
+    <div className={`silent-bid-input-row ${compact?"silent-bid-compact":""}`}>
+      {compact && <span className="silent-bid-team-name" style={{color:tc}}>{team.name}</span>}
+      {!compact && <div className="silent-bid-prompt">Your sealed bid for <strong>{team.name}</strong><br/><span style={{color:"var(--muted)",fontSize:".75rem"}}>Min: {crFmt(basePrice)} · Only you can see this</span></div>}
+      <div className="silent-bid-controls">
+        <input className="inp silent-bid-inp" type="number" step="0.25" min={basePrice}
+          value={val} onChange={e=>setVal(e.target.value)}
+          onKeyDown={e=>e.key==="Enter"&&submit()}
+          placeholder={crFmt(basePrice)} />
+        <button className="btn-add" onClick={submit} disabled={!val}>
+          {existing!=null?"Update":"🤫 Seal"}
+        </button>
+      </div>
+      {existing!=null&&compact&&<span className="silent-sealed">✓ {crFmt(existing)}</span>}
+    </div>
+  );
+}
+
+/* ── Alias for tie-breaker (reuses AuctionScreen logic) ── */
+function AuctionScreenInner(props) {
+  return <AuctionScreen {...props} />;
+}
+
 /* ── CSS ── */
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Syne:wght@600;700;800&display=swap');
@@ -2689,6 +2993,72 @@ const CSS = `
   .bulk-textarea{resize:vertical;min-height:100px;font-size:.82rem!important;line-height:1.6!important;font-family:'Inter',sans-serif!important}
   .bulk-controls{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
   .bulk-controls .btn-add{flex:1;min-width:120px}
+
+  /* ── silent bid mode ── */
+  .silent-mode-badge{
+    text-align:center;font-family:'Syne',sans-serif;font-size:.72rem;font-weight:800;
+    letter-spacing:3px;color:#d580ff;background:#1a0a2e;
+    border:1px solid #d580ff44;border-radius:20px;padding:.3rem 1rem;
+    margin-bottom:.5rem;align-self:center;
+    box-shadow:0 0 12px #d580ff22;
+  }
+  .silent-countdown{
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    width:120px;height:120px;border-radius:50%;
+    border:4px solid #b09dff55;background:var(--surface2);
+    margin:.5rem auto;transition:border-color .3s,box-shadow .3s;
+  }
+  .silent-warn{border-color:#ffaa0099;box-shadow:0 0 20px #ffaa0044}
+  .silent-crit{
+    border-color:#ff5577;box-shadow:0 0 30px #ff557766;
+    animation:pulse-red .5s ease-in-out infinite alternate;
+  }
+  .silent-timer-num{font-family:'Syne',sans-serif;font-size:2.5rem;font-weight:800;line-height:1;color:var(--text)}
+  .silent-timer-lbl{font-size:.58rem;color:var(--muted);letter-spacing:1px;text-transform:uppercase}
+  .silent-bid-status{text-align:center;font-size:.8rem;color:var(--muted);margin:.25rem 0}
+  .silent-bid-confirmed{
+    text-align:center;padding:.75rem 1.5rem;background:#041a10;
+    border:1px solid #00ff8844;border-radius:10px;color:#00ff88;font-weight:600;
+    font-size:.9rem;
+  }
+  .silent-host-override{display:flex;flex-direction:column;gap:.4rem;width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:.85rem}
+  .silent-override-title{font-size:.7rem;font-weight:700;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:.25rem}
+  .silent-bid-input-row{display:flex;flex-direction:column;gap:.4rem;padding:.5rem 0;border-bottom:1px solid var(--border)}
+  .silent-bid-input-row:last-of-type{border-bottom:none}
+  .silent-bid-compact{flex-direction:row;align-items:center;gap:.5rem;padding:.3rem 0}
+  .silent-bid-prompt{font-size:.82rem;line-height:1.4}
+  .silent-bid-controls{display:flex;gap:.4rem}
+  .silent-bid-inp{flex:1;min-width:80px}
+  .silent-bid-team-name{font-weight:600;font-size:.82rem;flex:1;min-width:80px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .silent-sealed{font-size:.72rem;color:#00ff88;font-weight:600;white-space:nowrap}
+
+  /* silent reveal */
+  .silent-reveal-title{
+    font-family:'Syne',sans-serif;font-size:1.5rem;font-weight:800;text-align:center;
+    background:linear-gradient(135deg,#d580ff,#b09dff,#00f0ff);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+    margin-bottom:.75rem;
+  }
+  .silent-bids-reveal{display:flex;flex-direction:column;gap:.4rem;width:100%}
+  .silent-bid-row{
+    display:flex;align-items:center;gap:.6rem;
+    background:var(--surface2);border:1px solid var(--border);
+    border-radius:10px;padding:.55rem .85rem;transition:all .3s;
+  }
+  .silent-bid-winner{background:#0a1a0a;box-shadow:0 0 16px rgba(0,255,136,.15)}
+  .silent-bid-rank{font-size:.75rem;font-weight:700;width:1.5rem;flex-shrink:0}
+  .silent-bid-team{flex:1;font-weight:600;font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .silent-bid-amount{font-family:'Syne',sans-serif;font-weight:700;font-size:.9rem;color:#ffe040;white-space:nowrap}
+  .silent-winner-tag{background:#00ff8822;color:#00ff88;border:1px solid #00ff8844;font-size:.68rem;font-weight:700;padding:.15rem .5rem;border-radius:6px;white-space:nowrap}
+  .silent-tie-tag{background:#ffe04022;color:#ffe040;border:1px solid #ffe04044;font-size:.68rem;font-weight:700;padding:.15rem .5rem;border-radius:6px;white-space:nowrap}
+  .silent-submitted-tag{font-size:.65rem;font-weight:700;padding:.15rem .45rem;border-radius:6px;white-space:nowrap}
+  .silent-reveal-bid{font-family:'Syne',sans-serif;font-weight:700;font-size:.85rem}
+  .silent-start-btn{background:linear-gradient(135deg,#6b20a0,#c040ff)!important;box-shadow:0 0 20px #d580ff44!important}
+
+  /* start mode buttons */
+  .start-mode-btns{display:flex;gap:.6rem;flex-wrap:wrap}
+  .start-mode-btns .btn-start{flex:1;min-width:150px}
+  .btn-silent-start{background:linear-gradient(135deg,#6b20a0,#c040ff)!important;box-shadow:0 0 20px #d580ff33!important}
   ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border-glow);border-radius:2px}
 `;
 
